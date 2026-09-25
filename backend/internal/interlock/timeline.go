@@ -2,7 +2,10 @@ package interlock
 
 import (
 	"fmt"
+	"math"
 	"sort"
+
+	"stage-rigging-cue-interlock/backend/internal/constants"
 )
 
 type ActionInput struct {
@@ -140,4 +143,33 @@ func DetectCollisionWindows(events []TimelineEvent) []CollisionWindow {
 		}
 	}
 	return windows
+}
+
+// DetectDeviceConflicts orders the actions that drive one device across
+// different cues and flags impossible or discontinuous motion. Collision
+// windows only compare different devices in a shared safety zone, so this
+// pass is what produces evidence when two cues drive the same device at
+// once. ExpandTimeline already rejects duplicate device actions inside one
+// cue, so every compared pair belongs to two different cues.
+func DetectDeviceConflicts(events []TimelineEvent) []RuleEvidence {
+	results := make([]RuleEvidence, 0)
+	for i := 0; i < len(events); i++ {
+		for j := i + 1; j < len(events); j++ {
+			previous, next := events[i], events[j]
+			if previous.DeviceID != next.DeviceID || previous.CueID == next.CueID {
+				continue
+			}
+			if start, end, overlaps := OverlapWindow(previous.StartMS, previous.EndMS, next.StartMS, next.EndMS); overlaps {
+				results = append(results, RuleEvidence{RuleCode: "DEVICE-OVERLAP", RuleType: "device_overlap", Result: constants.ResultInvalid, Severity: "invalid", CueCodes: []string{previous.CueCode, next.CueCode}, DeviceCodes: []string{previous.DeviceCode}, WindowStartMS: start, WindowEndMS: end, ActualValue: float64(end - start), ThresholdValue: 0, Unit: "ms overlap", Message: "two cues drive the same device during the same time window"})
+				continue
+			}
+			if next.StartMS == previous.EndMS {
+				gap := math.Abs(previous.ToPositionM - next.FromPositionM)
+				if gap > 0 {
+					results = append(results, RuleEvidence{RuleCode: "DEVICE-HANDOFF", RuleType: "device_handoff", Result: constants.ResultBlocker, Severity: "blocker", CueCodes: []string{previous.CueCode, next.CueCode}, DeviceCodes: []string{previous.DeviceCode}, WindowStartMS: previous.EndMS, WindowEndMS: previous.EndMS, ActualValue: gap, ThresholdValue: 0, Unit: "m handoff gap", Message: "device handoff end position does not match the next cue start position"})
+				}
+			}
+		}
+	}
+	return results
 }

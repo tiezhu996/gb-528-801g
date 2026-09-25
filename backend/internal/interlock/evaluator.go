@@ -63,6 +63,7 @@ func Evaluate(cueInputs []CueInput, deviceInputs []DeviceInput, rules []RuleInpu
 		}
 		evidence = append(evidence, results...)
 	}
+	evidence = append(evidence, DetectDeviceConflicts(timeline)...)
 	if len(evidence) == 0 {
 		evidence = append(evidence, RuleEvidence{RuleCode: "RULESET", RuleType: "summary", Result: constants.ResultPass, Severity: "informational", Message: "No enabled rule produced a warning or blocker for this snapshot."})
 	}
@@ -82,6 +83,7 @@ func Evaluate(cueInputs []CueInput, deviceInputs []DeviceInput, rules []RuleInpu
 	return Evaluation{OrderedCues: ordered, Timeline: timeline, RuleResults: evidence, CollisionWindows: windows, HighestSeverity: severity, TimelineStepMS: timelineStepMS, Assumptions: []string{
 		"Positions are linearly interpolated between each action's modeled endpoints.",
 		"Intervals are half-open: an action ending exactly when another begins does not overlap.",
+		"One device may not be driven by two cues at once; a touching handoff is valid only when the end position matches the next start position.",
 		"Rules and device limits are evaluated from the immutable snapshot stored with the run.",
 		"Results are offline rehearsal evidence only and never authorize or command machinery.",
 	}}, nil
