@@ -2,6 +2,7 @@ package interlock
 
 import (
 	"fmt"
+	"math"
 	"sort"
 )
 
@@ -140,4 +141,91 @@ func DetectCollisionWindows(events []TimelineEvent) []CollisionWindow {
 		}
 	}
 	return windows
+}
+
+// DeviceConflictKind identifies how one physical device is contended by two
+// actions that belong to different Cues.
+type DeviceConflictKind string
+
+const (
+	// DeviceConflictOverlap means two Cues drive the same device at the same
+	// time: the half-open action windows share at least one millisecond.
+	DeviceConflictOverlap DeviceConflictKind = "overlap"
+	// DeviceConflictHandoffMismatch means two Cues hand the device off with
+	// windows touching end-to-start, but the predecessor end position does not
+	// match the successor start position.
+	DeviceConflictHandoffMismatch DeviceConflictKind = "handoff_mismatch"
+)
+
+// positionToleranceM is the maximum modeled endpoint gap treated as the same
+// physical handoff position.
+const positionToleranceM = 1e-9
+
+// DeviceConflict is structural evidence that one device is contended by two
+// different Cues. It is independent of the configurable rule set because a
+// single hoist cannot follow two motion programs simultaneously.
+type DeviceConflict struct {
+	Kind       DeviceConflictKind
+	DeviceID   uint
+	DeviceCode string
+	First      TimelineEvent
+	Second     TimelineEvent
+	StartMS    int64
+	EndMS      int64
+	// ActualValue is the overlap duration in milliseconds, or the absolute handoff
+	// position gap in meters, depending on Kind.
+	ActualValue float64
+}
+
+// DetectDeviceConflicts scans timeline events for the same physical device
+// being driven by two different Cues. Overlapping action windows are an
+// invalid double-drive; windows that only touch end-to-start are a legal
+// relay only when the predecessor's end position matches the successor's
+// start position. A gap between two windows is neither: the device is idle in
+// between, so no continuity obligation applies.
+func DetectDeviceConflicts(events []TimelineEvent) []DeviceConflict {
+	byDevice := make(map[uint][]TimelineEvent)
+	for _, event := range events {
+		byDevice[event.DeviceID] = append(byDevice[event.DeviceID], event)
+	}
+	deviceIDs := make([]uint, 0, len(byDevice))
+	for deviceID := range byDevice {
+		deviceIDs = append(deviceIDs, deviceID)
+	}
+	sort.Slice(deviceIDs, func(i, j int) bool { return deviceIDs[i] < deviceIDs[j] })
+	conflicts := make([]DeviceConflict, 0)
+	for _, deviceID := range deviceIDs {
+		group := append([]TimelineEvent(nil), byDevice[deviceID]...)
+		sort.SliceStable(group, func(i, j int) bool {
+			if group[i].StartMS != group[j].StartMS {
+				return group[i].StartMS < group[j].StartMS
+			}
+			if group[i].EndMS != group[j].EndMS {
+				return group[i].EndMS < group[j].EndMS
+			}
+			if group[i].CueSequence != group[j].CueSequence {
+				return group[i].CueSequence < group[j].CueSequence
+			}
+			return group[i].CueCode < group[j].CueCode
+		})
+		for i := 0; i < len(group); i++ {
+			for j := i + 1; j < len(group); j++ {
+				left, right := group[i], group[j]
+				if left.CueID == right.CueID {
+					continue
+				}
+				if start, end, overlaps := OverlapWindow(left.StartMS, left.EndMS, right.StartMS, right.EndMS); overlaps {
+					conflicts = append(conflicts, DeviceConflict{Kind: DeviceConflictOverlap, DeviceID: deviceID, DeviceCode: left.DeviceCode, First: left, Second: right, StartMS: start, EndMS: end, ActualValue: float64(end - start)})
+					continue
+				}
+				if left.EndMS == right.StartMS {
+					gap := math.Abs(left.ToPositionM - right.FromPositionM)
+					if gap > positionToleranceM {
+						conflicts = append(conflicts, DeviceConflict{Kind: DeviceConflictHandoffMismatch, DeviceID: deviceID, DeviceCode: left.DeviceCode, First: left, Second: right, StartMS: left.EndMS, EndMS: right.StartMS, ActualValue: gap})
+					}
+				}
+			}
+		}
+	}
+	return conflicts
 }

@@ -32,6 +32,16 @@ type Evaluation struct {
 	Assumptions      []string                  `json:"assumptions"`
 }
 
+// Built-in structural checks that do not depend on a configured rule: one
+// physical device cannot be driven by two Cues at once, and an end-to-start
+// relay must continue from the same position.
+const (
+	deviceContentionCode = "DEVICE-CONTENTION"
+	deviceHandoffCode    = "DEVICE-HANDOFF"
+	deviceContentionType = "device_contention"
+	deviceHandoffType    = "device_handoff"
+)
+
 func Evaluate(cueInputs []CueInput, deviceInputs []DeviceInput, rules []RuleInput, timelineStepMS int64) (Evaluation, error) {
 	graphCues := make([]GraphCue, 0, len(cueInputs))
 	cues := make(map[uint]CueInput, len(cueInputs))
@@ -53,6 +63,9 @@ func Evaluate(cueInputs []CueInput, deviceInputs []DeviceInput, rules []RuleInpu
 	}
 	windows := DetectCollisionWindows(timeline)
 	evidence := make([]RuleEvidence, 0)
+	for _, conflict := range DetectDeviceConflicts(timeline) {
+		evidence = append(evidence, deviceConflictEvidence(conflict))
+	}
 	for _, rule := range rules {
 		if !rule.Enabled {
 			continue
@@ -82,6 +95,7 @@ func Evaluate(cueInputs []CueInput, deviceInputs []DeviceInput, rules []RuleInpu
 	return Evaluation{OrderedCues: ordered, Timeline: timeline, RuleResults: evidence, CollisionWindows: windows, HighestSeverity: severity, TimelineStepMS: timelineStepMS, Assumptions: []string{
 		"Positions are linearly interpolated between each action's modeled endpoints.",
 		"Intervals are half-open: an action ending exactly when another begins does not overlap.",
+		"One device driven by two different cues in an overlapping window is invalid; an end-to-start relay is legal only when the predecessor end position matches the successor start position.",
 		"Rules and device limits are evaluated from the immutable snapshot stored with the run.",
 		"Results are offline rehearsal evidence only and never authorize or command machinery.",
 	}}, nil
@@ -208,6 +222,15 @@ func evaluateDependencies(rule RuleInput, ordered []GraphCue, cues map[uint]CueI
 
 func breach(rule RuleInput, event TimelineEvent, actual, threshold float64, unit, message string) RuleEvidence {
 	return RuleEvidence{RuleCode: rule.RuleCode, RuleType: rule.RuleType, Result: severityResult(rule.Severity), Severity: rule.Severity, CueCodes: []string{event.CueCode}, DeviceCodes: []string{event.DeviceCode}, WindowStartMS: event.StartMS, WindowEndMS: event.EndMS, ActualValue: actual, ThresholdValue: threshold, Unit: unit, Message: message}
+}
+
+func deviceConflictEvidence(conflict DeviceConflict) RuleEvidence {
+	cueCodes := []string{conflict.First.CueCode, conflict.Second.CueCode}
+	deviceCodes := []string{conflict.DeviceCode}
+	if conflict.Kind == DeviceConflictOverlap {
+		return RuleEvidence{RuleCode: deviceContentionCode, RuleType: deviceContentionType, Result: constants.ResultInvalid, Severity: "invalid", CueCodes: cueCodes, DeviceCodes: deviceCodes, WindowStartMS: conflict.StartMS, WindowEndMS: conflict.EndMS, ActualValue: conflict.ActualValue, ThresholdValue: 0, Unit: "ms overlap", Message: "two cues drive the same device during an overlapping window; the device cannot follow both motion programs"}
+	}
+	return RuleEvidence{RuleCode: deviceHandoffCode, RuleType: deviceHandoffType, Result: constants.ResultBlocker, Severity: "blocker", CueCodes: cueCodes, DeviceCodes: deviceCodes, WindowStartMS: conflict.StartMS, WindowEndMS: conflict.EndMS, ActualValue: conflict.ActualValue, ThresholdValue: positionToleranceM, Unit: "m gap", Message: "end-to-start cue relay hands off the same device but the predecessor end position does not match the successor start position"}
 }
 
 func severityResult(severity string) constants.InterlockResult {
